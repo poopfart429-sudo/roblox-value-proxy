@@ -62,7 +62,11 @@ async function fetchWithRetry(url, options, maxRetries = 3) {
 
 		const retryAfterHeader = res.headers.get("retry-after");
 		const retryAfterSeconds = retryAfterHeader ? parseFloat(retryAfterHeader) : null;
-		const waitMs = retryAfterSeconds ? retryAfterSeconds * 1000 : 2000 * Math.pow(2, attempt);
+		// Cap exponential growth at 10s per wait so background retries don't
+		// stack up into very long waits when several items retry at once.
+		const waitMs = retryAfterSeconds
+			? retryAfterSeconds * 1000
+			: Math.min(2000 * Math.pow(2, attempt), 10000);
 		console.warn(`429 on ${url} — retrying in ${waitMs}ms`);
 		await sleep(waitMs);
 	}
@@ -175,13 +179,16 @@ async function fetchNonLimitedPriceInBackground(assetId) {
 	const now = Date.now();
 	try {
 		const url = `https://economy.roblox.com/v2/assets/${assetId}/details`;
-		// Single attempt, no retry-wait here — this already runs in the
-		// background so a slow retry loop doesn't matter, but we still cap
-		// it at 1 retry to avoid piling up dozens of in-flight requests if
-		// Roblox is rate-limiting hard.
-		const res = await fetchWithRetry(url, undefined, 1);
+		// More retries here than before — this runs in the background so a
+		// slower retry loop doesn't cost the player anything, and we've
+		// confirmed these calls DO eventually succeed, they were just slow
+		// to land on the first attempt.
+		const res = await fetchWithRetry(url, undefined, 4);
 		if (!res.ok) {
-			nonLimitedPriceCache.set(assetId, { price: 0, expires: now + 5 * 60 * 1000 });
+			// Don't cache a "0" for long on failure — retry again soon
+			// instead of giving up on this item for 5 minutes.
+			nonLimitedPriceCache.set(assetId, { price: 0, expires: now + 30 * 1000 });
+			console.warn(`[background price] Asset ${assetId} still failing after retries (status ${res.status})`);
 			return;
 		}
 		const data = await res.json();
@@ -195,8 +202,8 @@ async function fetchNonLimitedPriceInBackground(assetId) {
 		nonLimitedPriceCache.set(assetId, { price, expires: now + NON_LIMITED_CACHE_MS });
 		console.log(`[background price] Resolved asset ${assetId} -> ${price}`);
 	} catch (err) {
+		nonLimitedPriceCache.set(assetId, { price: 0, expires: now + 30 * 1000 });
 		console.warn(`[background price] Failed for asset ${assetId}: ${err.message}`);
-		nonLimitedPriceCache.set(assetId, { price: 0, expires: now + 5 * 60 * 1000 });
 	}
 }
 
