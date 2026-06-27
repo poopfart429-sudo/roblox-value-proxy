@@ -1,24 +1,44 @@
 /*
-	Roblox Value Proxy Server
+	Roblox Value Proxy Server (v2 — bulk-cached pricing)
 
-	Purpose: Roblox's HttpService cannot call *.roblox.com domains directly
-	(catalog.roblox.com, economy.roblox.com, avatar.roblox.com, etc — this is
-	a hard, permanent block with no setting to disable). This proxy sits in
-	between: your Roblox game calls THIS server, and THIS server calls Roblox's
-	APIs (which is allowed, since the call isn't coming from inside Roblox's
-	sandbox).
+	WHY THIS DESIGN:
+	Roblox blocks HttpService from calling catalog.roblox.com / economy.roblox.com
+	/ avatar.roblox.com directly from inside a Roblox game server — permanent,
+	no setting fixes it. So a separate server (this one) has to fetch that data
+	on the game's behalf.
+
+	The FIRST version of this proxy fetched prices live, per player, per
+	request. That works but hits Roblox's rate limits (HTTP 429) fast,
+	especially on shared-IP free hosting (Render free tier, etc), because
+	many players checking values = many rapid calls to economy.roblox.com.
+
+	THIS version instead:
+	  1. Runs a background job every REFRESH_INTERVAL_MS that pulls limited
+		 item prices in bulk from Roblox's catalog search endpoint (a handful
+		 of paginated calls every few hours, not one call per player per item).
+	  2. Stores results in an in-memory price table (assetId -> price info).
+	  3. When a player's value is requested, it looks up their EQUIPPED ITEM
+		 IDS live (this part is unavoidably per-player — there's no bulk way
+		 to ask "what is everyone wearing"), but prices come from the cached
+		 table, not a live lookup. This means each player check makes ONE
+		 cheap call (avatar.roblox.com) instead of one expensive call per item.
+
+	LIMITATION TO KNOW ABOUT:
+	The bulk "limiteds" catalog endpoint only reliably surfaces LIMITED items
+	(the ones with resale value). Common non-limited catalog accessories
+	(most everyday hats/items with no resale market) won't appear in this
+	bulk list and will show as price 0 unless you extend buildPriceTable()
+	to also sweep additional catalog categories. For a trading/flex-value
+	game, limiteds are almost always what actually matters for "Value", so
+	this is the right tradeoff to start with.
 
 	ENDPOINTS:
 	  GET /avatar-value?userId=123
-		-> Returns { totalValue, items: [{ assetId, name, assetType, price }] }
-		   Sums the CURRENT LISTED PRICE of every equipped avatar asset,
-		   EXCLUDING shirts and pants.
+		-> { userId, totalValue, items: [...], exclusiveCount, priceTableAge }
+	  GET /refresh-status
+		-> shows when the price table last refreshed, how many items cached
 
-	DEPLOY:
-	  1. npm install
-	  2. node server.js   (or deploy to Render/Railway/Glitch/a VPS)
-	  3. Note your server's public URL (e.g. https://your-app.onrender.com)
-	     You'll paste that URL into the Roblox-side ValueService script.
+	DEPLOY: same as before — npm install, then host on Render (or similar).
 */
 
 const express = require("express");
@@ -27,37 +47,97 @@ const fetch = require("node-fetch");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Asset type IDs to EXCLUDE (Shirt = 11, Pants = 12)
-const EXCLUDED_ASSET_TYPE_IDS = new Set([11, 12]);
+const EXCLUDED_ASSET_TYPE_IDS = new Set([11, 12]); // Shirt, Pants
 
-// Simple in-memory cache to avoid re-hitting Roblox's API constantly
-const priceCache = new Map(); // assetId -> { price, name, assetType, expires }
-const CACHE_MS = 10 * 60 * 1000; // 10 minutes
+const REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000; // refresh price table every 4 hours
+const PAGES_PER_REFRESH = 20; // how many catalog pages to pull per refresh (tune to taste)
+const DELAY_BETWEEN_CALLS_MS = 1500; // be polite between bulk calls during refresh
 
-// Fetches a URL, retrying on 429 (rate limit) with backoff.
-// Respects the Retry-After header when Roblox provides one.
+// ---- Shared in-memory price table, built by the background job ----
+let priceTable = new Map(); // assetId -> { name, price, isLimited, assetType }
+let lastRefreshTime = null;
+let isRefreshing = false;
+
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function fetchWithRetry(url, maxRetries = 3) {
 	for (let attempt = 0; attempt <= maxRetries; attempt++) {
 		const res = await fetch(url);
-
-		if (res.status !== 429) {
-			return res;
-		}
-
-		if (attempt === maxRetries) {
-			return res; // give up, let caller handle the failed response
-		}
+		if (res.status !== 429) return res;
+		if (attempt === maxRetries) return res;
 
 		const retryAfterHeader = res.headers.get("retry-after");
 		const retryAfterSeconds = retryAfterHeader ? parseFloat(retryAfterHeader) : null;
-		const waitMs = retryAfterSeconds ? retryAfterSeconds * 1000 : 500 * Math.pow(2, attempt);
-
-		console.warn(`429 received, retrying in ${waitMs}ms (attempt ${attempt + 1}/${maxRetries})`);
-		await new Promise((resolve) => setTimeout(resolve, waitMs));
+		const waitMs = retryAfterSeconds ? retryAfterSeconds * 1000 : 1000 * Math.pow(2, attempt);
+		console.warn(`429 on ${url} — retrying in ${waitMs}ms`);
+		await sleep(waitMs);
 	}
 }
 
-async function getAvatarAssetIds(userId) {
+// Pulls a page of currently-trading limited items from Roblox's catalog
+// search (Category 2 = Collectibles), in bulk.
+// NOTE: this endpoint's query params are case-sensitive (Category, Limit,
+// SortType, Cursor — capitalized), unlike most other Roblox endpoints.
+async function fetchLimitedsPage(cursor) {
+	let url =
+		"https://catalog.roblox.com/v1/search/items/details?Category=2&Limit=120&SortType=3";
+	if (cursor) {
+		url += `&Cursor=${encodeURIComponent(cursor)}`;
+	}
+	const res = await fetchWithRetry(url);
+	if (!res.ok) {
+		throw new Error(`catalog search responded ${res.status}`);
+	}
+	return res.json();
+}
+
+// The background job: walks several pages of the limiteds catalog and
+// rebuilds the price table. Runs on a timer, NOT per player request.
+async function buildPriceTable() {
+	if (isRefreshing) return; // don't overlap refreshes
+	isRefreshing = true;
+	console.log("[refresh] Starting price table refresh...");
+
+	const newTable = new Map();
+	let cursor = null;
+
+	try {
+		for (let page = 0; page < PAGES_PER_REFRESH; page++) {
+			const data = await fetchLimitedsPage(cursor);
+			const items = data.data || [];
+
+			for (const item of items) {
+				if (EXCLUDED_ASSET_TYPE_IDS.has(item.assetType)) continue;
+
+				newTable.set(item.id, {
+					name: item.name || "Unknown",
+					price: typeof item.price === "number" ? item.price : 0,
+					isLimited: true,
+					assetType: item.assetType ?? null,
+				});
+			}
+
+			cursor = data.nextPageCursor;
+			if (!cursor) break; // no more pages
+
+			await sleep(DELAY_BETWEEN_CALLS_MS);
+		}
+
+		priceTable = newTable;
+		lastRefreshTime = Date.now();
+		console.log(`[refresh] Done. Cached ${priceTable.size} items.`);
+	} catch (err) {
+		console.error("[refresh] Failed:", err.message);
+		// keep serving the OLD priceTable on failure rather than wiping it
+	} finally {
+		isRefreshing = false;
+	}
+}
+
+// ---- Per-player lookup (this part stays live, it's cheap) ----
+async function getEquippedAssets(userId) {
 	const url = `https://avatar.roblox.com/v1/users/${userId}/avatar`;
 	const res = await fetchWithRetry(url);
 	if (!res.ok) {
@@ -71,45 +151,6 @@ async function getAvatarAssetIds(userId) {
 	}));
 }
 
-// Gets current listed price for a single asset using the no-auth
-// economy.roblox.com endpoint (the catalog/items/details endpoint requires
-// POST + token validation and is unreliable without a logged-in session,
-// so we avoid it here).
-async function getCurrentPrice(assetId) {
-	const cached = priceCache.get(assetId);
-	if (cached && cached.expires > Date.now()) {
-		return cached;
-	}
-
-	const url = `https://economy.roblox.com/v2/assets/${assetId}/details`;
-	const res = await fetchWithRetry(url);
-	if (!res.ok) {
-		throw new Error(`economy.roblox.com responded ${res.status}`);
-	}
-	const data = await res.json();
-
-	// Limiteds: current price = lowest active resale listing (already folded
-	// into PriceInRobux for limiteds on this endpoint).
-	// Non-limiteds: fixed sale price, also in PriceInRobux.
-	const price =
-		typeof data.PriceInRobux === "number"
-			? data.PriceInRobux
-			: typeof data.LowestPrice === "number"
-			? data.LowestPrice
-			: 0;
-
-	const result = {
-		price,
-		name: data.Name || "Unknown",
-		assetType: data.AssetTypeId ?? data.assetTypeId ?? null,
-		isLimited: Boolean(data.IsLimited || data.IsLimitedUnique),
-		expires: Date.now() + CACHE_MS,
-	};
-
-	priceCache.set(assetId, result);
-	return result;
-}
-
 app.get("/avatar-value", async (req, res) => {
 	const userId = parseInt(req.query.userId, 10);
 	if (!userId || Number.isNaN(userId)) {
@@ -117,42 +158,64 @@ app.get("/avatar-value", async (req, res) => {
 	}
 
 	try {
-		const assets = await getAvatarAssetIds(userId);
+		const equipped = await getEquippedAssets(userId);
 
 		let totalValue = 0;
+		let exclusiveCount = 0;
 		const items = [];
 
-		for (const asset of assets) {
-			if (EXCLUDED_ASSET_TYPE_IDS.has(asset.assetType)) {
-				continue; // skip shirts/pants from the avatar list itself
-			}
+		for (const asset of equipped) {
+			if (EXCLUDED_ASSET_TYPE_IDS.has(asset.assetType)) continue;
 
-			const priced = await getCurrentPrice(asset.id);
+			const cached = priceTable.get(asset.id);
+			const price = cached ? cached.price : 0;
+			const isLimited = cached ? cached.isLimited : false;
 
-			if (EXCLUDED_ASSET_TYPE_IDS.has(priced.assetType)) {
-				continue; // also skip based on catalog's own assetType, as a safety net
-			}
+			if (isLimited) exclusiveCount += 1;
+			totalValue += price;
 
-			totalValue += priced.price;
 			items.push({
 				assetId: asset.id,
-				name: priced.name,
-				assetType: priced.assetType,
-				price: priced.price,
+				name: asset.name,
+				price,
+				isLimited,
 			});
 		}
 
-		res.json({ userId, totalValue, items });
+		res.json({
+			userId,
+			totalValue,
+			exclusiveCount,
+			items,
+			priceTableAge: lastRefreshTime ? Date.now() - lastRefreshTime : null,
+		});
 	} catch (err) {
 		console.error("Error fetching avatar value:", err.message);
 		res.status(502).json({ error: "Failed to fetch avatar value", detail: err.message });
 	}
 });
 
+app.get("/refresh-status", (req, res) => {
+	res.json({
+		cachedItemCount: priceTable.size,
+		lastRefreshTime,
+		isRefreshing,
+		ageMs: lastRefreshTime ? Date.now() - lastRefreshTime : null,
+	});
+});
+
+// Manual trigger, useful for testing without waiting hours for the timer
+app.get("/force-refresh", async (req, res) => {
+	buildPriceTable(); // fire and forget, don't block the response
+	res.json({ message: "Refresh started in background. Check /refresh-status for progress." });
+});
+
 app.get("/", (req, res) => {
-	res.send("Roblox Value Proxy is running. Use /avatar-value?userId=123");
+	res.send("Roblox Value Proxy (bulk-cached) is running. Use /avatar-value?userId=123");
 });
 
 app.listen(PORT, () => {
 	console.log(`Proxy server listening on port ${PORT}`);
+	buildPriceTable(); // build the table once on startup
+	setInterval(buildPriceTable, REFRESH_INTERVAL_MS); // then keep it fresh on a timer
 });
