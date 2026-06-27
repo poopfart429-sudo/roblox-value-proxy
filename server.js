@@ -50,7 +50,7 @@ const PORT = process.env.PORT || 3000;
 const EXCLUDED_ASSET_TYPE_IDS = new Set([11, 12]); // Shirt, Pants
 
 const REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000; // refresh price table every 4 hours
-const PAGES_PER_REFRESH = 20; // how many catalog pages to pull per refresh (tune to taste)
+const PAGES_PER_REFRESH = 40; // how many catalog pages to pull per refresh (tune to taste)
 const DELAY_BETWEEN_CALLS_MS = 1500; // be polite between bulk calls during refresh
 
 // ---- Shared in-memory price table, built by the background job ----
@@ -82,11 +82,10 @@ async function fetchWithRetry(url, maxRetries = 3) {
 // SortType, Cursor — capitalized), unlike most other Roblox endpoints.
 async function fetchLimitedsPage(cursor) {
 	// Category=2 (Collectibles) + SortType=0 (relevance) is a documented-safe
-	// combo. SortType=3 caused a 400 ("Category subcategory selection not
-	// supported" is the typical error for invalid Category/SortType pairs
-	// on this endpoint), so we stick to SortType=0 here.
+	// combo. Despite docs claiming Limit accepts up to 120, the live endpoint
+	// currently only allows 10, 28, or 30 — so we use the max of those (30).
 	let url =
-		"https://catalog.roblox.com/v1/search/items/details?Category=2&Limit=120&SortType=0";
+		"https://catalog.roblox.com/v1/search/items/details?Category=2&Limit=30&SortType=0";
 	if (cursor) {
 		url += `&Cursor=${encodeURIComponent(cursor)}`;
 	}
