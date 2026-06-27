@@ -1,0 +1,13 @@
+{
+  "name": "roblox-value-proxy",
+  "version": "1.0.0",
+  "description": "Proxy server so a Roblox game can fetch catalog item prices (current listed price for limiteds and non-limiteds), bypassing Roblox's HttpService domain block.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0"
+  }
+}
