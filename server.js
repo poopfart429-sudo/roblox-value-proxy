@@ -34,9 +34,32 @@ const EXCLUDED_ASSET_TYPE_IDS = new Set([11, 12]);
 const priceCache = new Map(); // assetId -> { price, name, assetType, expires }
 const CACHE_MS = 10 * 60 * 1000; // 10 minutes
 
+// Fetches a URL, retrying on 429 (rate limit) with backoff.
+// Respects the Retry-After header when Roblox provides one.
+async function fetchWithRetry(url, maxRetries = 3) {
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+		const res = await fetch(url);
+
+		if (res.status !== 429) {
+			return res;
+		}
+
+		if (attempt === maxRetries) {
+			return res; // give up, let caller handle the failed response
+		}
+
+		const retryAfterHeader = res.headers.get("retry-after");
+		const retryAfterSeconds = retryAfterHeader ? parseFloat(retryAfterHeader) : null;
+		const waitMs = retryAfterSeconds ? retryAfterSeconds * 1000 : 500 * Math.pow(2, attempt);
+
+		console.warn(`429 received, retrying in ${waitMs}ms (attempt ${attempt + 1}/${maxRetries})`);
+		await new Promise((resolve) => setTimeout(resolve, waitMs));
+	}
+}
+
 async function getAvatarAssetIds(userId) {
 	const url = `https://avatar.roblox.com/v1/users/${userId}/avatar`;
-	const res = await fetch(url);
+	const res = await fetchWithRetry(url);
 	if (!res.ok) {
 		throw new Error(`avatar.roblox.com responded ${res.status}`);
 	}
@@ -59,7 +82,7 @@ async function getCurrentPrice(assetId) {
 	}
 
 	const url = `https://economy.roblox.com/v2/assets/${assetId}/details`;
-	const res = await fetch(url);
+	const res = await fetchWithRetry(url);
 	if (!res.ok) {
 		throw new Error(`economy.roblox.com responded ${res.status}`);
 	}
