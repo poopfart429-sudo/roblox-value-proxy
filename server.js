@@ -50,7 +50,7 @@ const PORT = process.env.PORT || 3000;
 const EXCLUDED_ASSET_TYPE_IDS = new Set([11, 12]); // Shirt, Pants
 
 const REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000; // refresh price table every 4 hours
-const PAGES_PER_REFRESH = 40; // how many catalog pages to pull per refresh (tune to taste)
+const PAGES_PER_REFRESH = 100; // no category filter now, so we need more pages to find enough limiteds
 const DELAY_BETWEEN_CALLS_MS = 1500; // be polite between bulk calls during refresh
 
 // ---- Shared in-memory price table, built by the background job ----
@@ -81,11 +81,14 @@ async function fetchWithRetry(url, maxRetries = 3) {
 // NOTE: this endpoint's query params are case-sensitive (Category, Limit,
 // SortType, Cursor — capitalized), unlike most other Roblox endpoints.
 async function fetchLimitedsPage(cursor) {
-	// Category=2 (Collectibles) + SortType=0 (relevance) is a documented-safe
-	// combo. Despite docs claiming Limit accepts up to 120, the live endpoint
-	// currently only allows 10, 28, or 30 — so we use the max of those (30).
-	let url =
-		"https://catalog.roblox.com/v1/search/items/details?Category=2&Limit=30&SortType=0";
+	// Roblox's Category/Subcategory combos on this endpoint are inconsistent
+	// and not well documented (confirmed by multiple Roblox dev forum threads
+	// reporting incorrect/outdated docs and "not supported" errors on valid-
+	// looking combos). Omitting Category and just using SortType=0 (relevance)
+	// with no category filter is the most reliably accepted shape; we filter
+	// for limited/collectible items client-side afterward instead of relying
+	// on the API's category filter.
+	let url = "https://catalog.roblox.com/v1/search/items/details?Limit=30&SortType=0";
 	if (cursor) {
 		url += `&Cursor=${encodeURIComponent(cursor)}`;
 	}
@@ -115,6 +118,11 @@ async function buildPriceTable() {
 			for (const item of items) {
 				if (EXCLUDED_ASSET_TYPE_IDS.has(item.assetType)) continue;
 
+				// We no longer filter by Category server-side (that param was
+				// unreliable), so filter for limiteds/collectibles ourselves.
+				const isLimited = Boolean(item.isLimited || item.isLimitedUnique);
+				if (!isLimited) continue;
+
 				newTable.set(item.id, {
 					name: item.name || "Unknown",
 					price: typeof item.price === "number" ? item.price : 0,
@@ -125,6 +133,10 @@ async function buildPriceTable() {
 
 			cursor = data.nextPageCursor;
 			if (!cursor) break; // no more pages
+
+			if (page % 10 === 0) {
+				console.log(`[refresh] page ${page}, ${newTable.size} limiteds found so far`);
+			}
 
 			await sleep(DELAY_BETWEEN_CALLS_MS);
 		}
