@@ -144,17 +144,20 @@ async function getEquippedAssets(userId) {
 // Rolimons only tracks limiteds, so any regular catalog item (a normal shirt,
 // gear, free hat, etc) won't be in priceTable. For those we look up the
 // price live, per item — but NEVER make the player's /avatar-value request
-// wait on that lookup. economy.roblox.com has been rate-limiting this
-// proxy's IP persistently (confirmed via logs), so retries there can take
-// 10-60+ seconds. Blocking on that made /avatar-value feel like it hung.
+// wait on that lookup.
 //
-// Instead: if we already have a cached price, return it instantly. If not,
-// kick off the slow lookup in the BACKGROUND (don't await it here) and
-// return 0 for THIS request only. The result gets cached, so the next time
-// anyone checks a player wearing that same item, it's instant and accurate.
+// IMPORTANT: firing many background lookups in PARALLEL (one per uncached
+// item, all at once) made the 429s worse, not better — economy.roblox.com
+// seems to tolerate occasional single requests but chokes on bursts. So
+// instead of one fetch per item fired immediately, uncached items get
+// pushed into a QUEUE and processed ONE AT A TIME with a delay between
+// each, no matter how many items across how many players are waiting.
 const nonLimitedPriceCache = new Map(); // assetId -> { price, expires }
 const NON_LIMITED_CACHE_MS = 6 * 60 * 60 * 1000; // 6 hours — these prices are stable
-const pendingLookups = new Set(); // assetIds currently being fetched in the background, avoid duplicate work
+const queuedAssetIds = new Set(); // assetIds already waiting in the queue, avoid duplicates
+const lookupQueue = [];
+let queueRunning = false;
+const DELAY_BETWEEN_QUEUE_ITEMS_MS = 2500; // be polite, one request at a time
 
 function getNonLimitedPriceInstant(assetId) {
 	const now = Date.now();
@@ -163,32 +166,44 @@ function getNonLimitedPriceInstant(assetId) {
 		return cached.price;
 	}
 
-	// Not cached — kick off a background fetch if one isn't already running
-	// for this asset, but don't make the caller wait for it.
-	if (!pendingLookups.has(assetId)) {
-		pendingLookups.add(assetId);
-		fetchNonLimitedPriceInBackground(assetId).finally(() => {
-			pendingLookups.delete(assetId);
-		});
+	if (!queuedAssetIds.has(assetId)) {
+		queuedAssetIds.add(assetId);
+		lookupQueue.push(assetId);
+		runQueue(); // make sure the queue processor is going, but don't await it
 	}
 
 	return 0; // best we can do for THIS request; next request will have it cached
 }
 
-async function fetchNonLimitedPriceInBackground(assetId) {
+async function runQueue() {
+	if (queueRunning) return; // only one processor loop at a time
+	queueRunning = true;
+
+	while (lookupQueue.length > 0) {
+		const assetId = lookupQueue.shift();
+		queuedAssetIds.delete(assetId);
+
+		await fetchNonLimitedPriceOnce(assetId);
+
+		if (lookupQueue.length > 0) {
+			await sleep(DELAY_BETWEEN_QUEUE_ITEMS_MS);
+		}
+	}
+
+	queueRunning = false;
+}
+
+async function fetchNonLimitedPriceOnce(assetId) {
 	const now = Date.now();
 	try {
 		const url = `https://economy.roblox.com/v2/assets/${assetId}/details`;
-		// More retries here than before — this runs in the background so a
-		// slower retry loop doesn't cost the player anything, and we've
-		// confirmed these calls DO eventually succeed, they were just slow
-		// to land on the first attempt.
-		const res = await fetchWithRetry(url, undefined, 4);
+		// No retries here — the queue itself spaces requests out, and a
+		// failed item just gets a short-lived 0 and can be re-queued by a
+		// future request rather than retried in a tight loop right now.
+		const res = await fetchWithRetry(url, undefined, 0);
 		if (!res.ok) {
-			// Don't cache a "0" for long on failure — retry again soon
-			// instead of giving up on this item for 5 minutes.
 			nonLimitedPriceCache.set(assetId, { price: 0, expires: now + 30 * 1000 });
-			console.warn(`[background price] Asset ${assetId} still failing after retries (status ${res.status})`);
+			console.warn(`[queue price] Asset ${assetId} failed (status ${res.status})`);
 			return;
 		}
 		const data = await res.json();
@@ -200,10 +215,10 @@ async function fetchNonLimitedPriceInBackground(assetId) {
 				: 0;
 
 		nonLimitedPriceCache.set(assetId, { price, expires: now + NON_LIMITED_CACHE_MS });
-		console.log(`[background price] Resolved asset ${assetId} -> ${price}`);
+		console.log(`[queue price] Resolved asset ${assetId} -> ${price}`);
 	} catch (err) {
 		nonLimitedPriceCache.set(assetId, { price: 0, expires: now + 30 * 1000 });
-		console.warn(`[background price] Failed for asset ${assetId}: ${err.message}`);
+		console.warn(`[queue price] Failed for asset ${assetId}: ${err.message}`);
 	}
 }
 
@@ -264,6 +279,8 @@ app.get("/refresh-status", (req, res) => {
 	res.json({
 		cachedLimitedItemCount: priceTable.size,
 		cachedNonLimitedItemCount: nonLimitedPriceCache.size,
+		queueLength: lookupQueue.length,
+		queueRunning,
 		lastRefreshTime,
 		isRefreshing,
 		ageMs: lastRefreshTime ? Date.now() - lastRefreshTime : null,
