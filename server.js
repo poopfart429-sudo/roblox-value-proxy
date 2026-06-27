@@ -139,28 +139,50 @@ async function getEquippedAssets(userId) {
 // ---- Non-limited item pricing (fallback for items not in the Rolimons table) ----
 // Rolimons only tracks limiteds, so any regular catalog item (a normal shirt,
 // gear, free hat, etc) won't be in priceTable. For those we look up the
-// price live, per item, but ONLY for items a specific player actually has
-// equipped — typically a handful per check, not a bulk scan. Cached for a
-// long time per item since non-limited prices rarely change.
+// price live, per item — but NEVER make the player's /avatar-value request
+// wait on that lookup. economy.roblox.com has been rate-limiting this
+// proxy's IP persistently (confirmed via logs), so retries there can take
+// 10-60+ seconds. Blocking on that made /avatar-value feel like it hung.
+//
+// Instead: if we already have a cached price, return it instantly. If not,
+// kick off the slow lookup in the BACKGROUND (don't await it here) and
+// return 0 for THIS request only. The result gets cached, so the next time
+// anyone checks a player wearing that same item, it's instant and accurate.
 const nonLimitedPriceCache = new Map(); // assetId -> { price, expires }
 const NON_LIMITED_CACHE_MS = 6 * 60 * 60 * 1000; // 6 hours — these prices are stable
+const pendingLookups = new Set(); // assetIds currently being fetched in the background, avoid duplicate work
 
-async function getNonLimitedPrice(assetId) {
+function getNonLimitedPriceInstant(assetId) {
 	const now = Date.now();
 	const cached = nonLimitedPriceCache.get(assetId);
 	if (cached && cached.expires > now) {
 		return cached.price;
 	}
 
+	// Not cached — kick off a background fetch if one isn't already running
+	// for this asset, but don't make the caller wait for it.
+	if (!pendingLookups.has(assetId)) {
+		pendingLookups.add(assetId);
+		fetchNonLimitedPriceInBackground(assetId).finally(() => {
+			pendingLookups.delete(assetId);
+		});
+	}
+
+	return 0; // best we can do for THIS request; next request will have it cached
+}
+
+async function fetchNonLimitedPriceInBackground(assetId) {
+	const now = Date.now();
 	try {
 		const url = `https://economy.roblox.com/v2/assets/${assetId}/details`;
-		const res = await fetchWithRetry(url);
+		// Single attempt, no retry-wait here — this already runs in the
+		// background so a slow retry loop doesn't matter, but we still cap
+		// it at 1 retry to avoid piling up dozens of in-flight requests if
+		// Roblox is rate-limiting hard.
+		const res = await fetchWithRetry(url, undefined, 1);
 		if (!res.ok) {
-			// Don't throw — a single failed item shouldn't break the whole
-			// player lookup. Cache a 0 briefly so we don't hammer a broken
-			// asset id repeatedly within the same refresh window.
 			nonLimitedPriceCache.set(assetId, { price: 0, expires: now + 5 * 60 * 1000 });
-			return 0;
+			return;
 		}
 		const data = await res.json();
 		const price =
@@ -171,11 +193,10 @@ async function getNonLimitedPrice(assetId) {
 				: 0;
 
 		nonLimitedPriceCache.set(assetId, { price, expires: now + NON_LIMITED_CACHE_MS });
-		return price;
+		console.log(`[background price] Resolved asset ${assetId} -> ${price}`);
 	} catch (err) {
-		console.warn(`[non-limited price] Failed for asset ${assetId}: ${err.message}`);
+		console.warn(`[background price] Failed for asset ${assetId}: ${err.message}`);
 		nonLimitedPriceCache.set(assetId, { price: 0, expires: now + 5 * 60 * 1000 });
-		return 0;
 	}
 }
 
@@ -203,9 +224,10 @@ app.get("/avatar-value", async (req, res) => {
 				price = cached.value;
 				exclusiveCount += 1;
 			} else {
-				// Not a limited — look up its regular catalog price instead
-				// of just defaulting to 0, so non-limited items count too.
-				price = await getNonLimitedPrice(asset.id);
+				// Not a limited — try cache instantly; if uncached, this
+				// returns 0 for now and resolves the real price in the
+				// background for next time (never blocks this response).
+				price = getNonLimitedPriceInstant(asset.id);
 			}
 
 			totalValue += price;
