@@ -81,14 +81,19 @@ async function fetchWithRetry(url, maxRetries = 3) {
 // NOTE: this endpoint's query params are case-sensitive (Category, Limit,
 // SortType, Cursor — capitalized), unlike most other Roblox endpoints.
 async function fetchLimitedsPage(cursor) {
+	// Category=2 (Collectibles) + SortType=0 (relevance) is a documented-safe
+	// combo. SortType=3 caused a 400 ("Category subcategory selection not
+	// supported" is the typical error for invalid Category/SortType pairs
+	// on this endpoint), so we stick to SortType=0 here.
 	let url =
-		"https://catalog.roblox.com/v1/search/items/details?Category=2&Limit=120&SortType=3";
+		"https://catalog.roblox.com/v1/search/items/details?Category=2&Limit=120&SortType=0";
 	if (cursor) {
 		url += `&Cursor=${encodeURIComponent(cursor)}`;
 	}
 	const res = await fetchWithRetry(url);
 	if (!res.ok) {
-		throw new Error(`catalog search responded ${res.status}`);
+		const bodyText = await res.text().catch(() => "(could not read body)");
+		throw new Error(`catalog search responded ${res.status}: ${bodyText}`);
 	}
 	return res.json();
 }
